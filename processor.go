@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -123,12 +124,16 @@ func enrichLine(line string, searcher *IPSearcher, ipField, geoField string, cle
 		}
 	}
 
-	result, err := json.Marshal(logEntry)
-	if err != nil {
+	// 使用 Encoder 并关闭 HTML 转义，避免 & < > 被转成 & 等 Unicode 转义序列
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(logEntry); err != nil {
 		return "", fmt.Errorf("JSON 序列化失败: %w", err)
 	}
 
-	return string(result), nil
+	// Encode 会在末尾追加换行符，去掉它保持与原行一致
+	return string(bytes.TrimRight(buf.Bytes(), "\n")), nil
 }
 
 // writeEnriched 增强一行日志并写入，返回是否成功
@@ -136,11 +141,15 @@ func writeEnriched(line string, searcher *IPSearcher, ipField, geoField string, 
 	enriched, err := enrichLine(line, searcher, ipField, geoField, cleaner)
 	if err != nil {
 		log.Printf("[WARN] 处理行失败: %v，原始内容: %.200s", err, line)
-		// 用 json.Marshal 构造，保证 fallback 仍是合法 JSON（原始行可能非法，须作为字符串转义）
-		fallback, mErr := json.Marshal(map[string]string{
+		// 构造 fallback JSON，关闭 HTML 转义保持原内容不变
+		var fbBuf bytes.Buffer
+		fbEnc := json.NewEncoder(&fbBuf)
+		fbEnc.SetEscapeHTML(false)
+		mErr := fbEnc.Encode(map[string]string{
 			"_error": err.Error(),
 			"_raw":   line,
 		})
+		fallback := bytes.TrimRight(fbBuf.Bytes(), "\n")
 		if mErr != nil {
 			fallback = []byte(`{"_error":"fallback marshal failed"}`)
 		}
