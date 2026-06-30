@@ -29,6 +29,11 @@ func main() {
 		log.Fatalf("[FATAL] 输入文件和输出文件不能相同: %s", *inputFile)
 	}
 
+	// 错误日志输出路径：在扩展名前插入 _err（如 accesslog_geo.log → accesslog_geo_err.log）
+	ext := filepath.Ext(*outputFile)
+	base := strings.TrimSuffix(*outputFile, ext)
+	errOutputFile := base + "_err" + ext
+
 	if *checkpointPath == "" {
 		*checkpointPath = filepath.Join(filepath.Dir(*outputFile), ".nginx-geo-enricher.checkpoint")
 	}
@@ -36,6 +41,7 @@ func main() {
 	log.Printf("[INFO] ======== nginx 日志地理位置增强工具 ========")
 	log.Printf("[INFO] 输入文件:    %s", *inputFile)
 	log.Printf("[INFO] 输出文件:    %s", *outputFile)
+	log.Printf("[INFO] 错误输出:    %s", errOutputFile)
 	log.Printf("[INFO] 断点文件:    %s", *checkpointPath)
 	log.Printf("[INFO] IP 字段:     %s", *ipField)
 	log.Printf("[INFO] Geo 字段:    %s", *geoField)
@@ -75,7 +81,15 @@ func main() {
 	}
 	defer outFile.Close()
 
+	// 打开错误日志输出文件（追加模式）
+	errFile, err := os.OpenFile(errOutputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("[FATAL] 无法打开错误输出文件 %s: %v", errOutputFile, err)
+	}
+	defer errFile.Close()
+
 	writer := bufio.NewWriterSize(outFile, 512*1024)
+	errWriter := bufio.NewWriterSize(errFile, 64*1024)
 
 	// ======== 断点恢复 ========
 	cp, cpErr := loadCheckpoint(*checkpointPath)
@@ -101,12 +115,15 @@ func main() {
 			oldFile, findErr := findFileByInode(dir, cp.Inode)
 			if findErr == nil {
 				log.Printf("[INFO] 找到轮转后的旧文件: %s", oldFile)
-				p, e, finalOff := processRotatedFile(oldFile, cp.Offset, searcher, *ipField, *geoField, writer, cleaner)
+				p, e, finalOff := processRotatedFile(oldFile, cp.Offset, searcher, *ipField, *geoField, writer, errWriter, cleaner)
 				// 先 flush 输出再落 checkpoint，标记旧文件已消费完，保证补齐过程崩溃可恢复
 				if err := writer.Flush(); err != nil {
 					log.Printf("[WARN] flush 输出失败: %v", err)
 				} else {
 					saveCheckpoint(*checkpointPath, &Checkpoint{Path: *inputFile, Inode: cp.Inode, Offset: finalOff})
+				}
+				if err := errWriter.Flush(); err != nil {
+					log.Printf("[WARN] flush 错误输出失败: %v", err)
 				}
 				log.Printf("[INFO] 旧文件补齐完成: %d 条成功, %d 条失败, 最终偏移=%d", p, e, finalOff)
 			} else {
@@ -146,27 +163,38 @@ func main() {
 			log.Printf("[WARN] flush 输出失败，暂不推进断点: %v", err)
 			return
 		}
+		// 错误日志也刷盘（失败仅告警，不阻塞主断点推进）
+		if err := errWriter.Flush(); err != nil {
+			log.Printf("[WARN] flush 错误输出失败: %v", err)
+		}
 		// 如需抗"断电"（而非仅进程崩溃），可在此追加 outFile.Sync()，但有明显性能开销
 		saveCheckpoint(*checkpointPath, &Checkpoint{Path: *inputFile, Inode: lastInode, Offset: lastOffset})
 		linesSinceSave = 0
 	}
 
-	// rotateOutput 在输入日志轮转时同步轮转输出文件。
+	// rotateOutput 在输入日志轮转时同步轮转输出文件和错误日志文件。
 	// 将当前输出文件重命名为带日期后缀（与原日志轮转格式一致），然后打开新文件继续写入。
 	rotateOutput := func(rotateTime time.Time) {
 		// 1. 先 flush 确保旧 writer 缓冲区数据全部落盘
 		if err := writer.Flush(); err != nil {
 			log.Printf("[WARN] 轮转前 flush 输出失败: %v", err)
 		}
+		if err := errWriter.Flush(); err != nil {
+			log.Printf("[WARN] 轮转前 flush 错误输出失败: %v", err)
+		}
 		// 2. 关闭当前输出文件
 		if err := outFile.Close(); err != nil {
 			log.Printf("[WARN] 关闭旧输出文件失败: %v", err)
 		}
+		if err := errFile.Close(); err != nil {
+			log.Printf("[WARN] 关闭旧错误输出文件失败: %v", err)
+		}
 
 		// 3. 重命名输出文件，日期后缀格式与输入日志轮转一致 (例如 accesslog.log-20260630)
 		dateSuffix := rotateTime.Format("20060102")
+
+		// 3a. 轮转主输出文件
 		rotatedPath := *outputFile + "-" + dateSuffix
-		// 若目标已存在（极少情况，如同一天多次轮转），追加序号
 		if _, err := os.Stat(rotatedPath); err == nil {
 			for i := 1; i < 100; i++ {
 				altPath := fmt.Sprintf("%s-%s.%d", *outputFile, dateSuffix, i)
@@ -182,6 +210,23 @@ func main() {
 			log.Printf("[INFO] 输出文件已轮转: %s -> %s", *outputFile, rotatedPath)
 		}
 
+		// 3b. 轮转错误输出文件
+		errRotatedPath := errOutputFile + "-" + dateSuffix
+		if _, err := os.Stat(errRotatedPath); err == nil {
+			for i := 1; i < 100; i++ {
+				altPath := fmt.Sprintf("%s-%s.%d", errOutputFile, dateSuffix, i)
+				if _, err := os.Stat(altPath); os.IsNotExist(err) {
+					errRotatedPath = altPath
+					break
+				}
+			}
+		}
+		if err := os.Rename(errOutputFile, errRotatedPath); err != nil {
+			log.Printf("[WARN] 轮转错误输出文件失败: %v", err)
+		} else {
+			log.Printf("[INFO] 错误输出文件已轮转: %s -> %s", errOutputFile, errRotatedPath)
+		}
+
 		// 4. 打开新的输出文件（追加模式）
 		newFile, err := os.OpenFile(*outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
@@ -189,7 +234,15 @@ func main() {
 		}
 		outFile = newFile
 		writer = bufio.NewWriterSize(newFile, 512*1024)
-		log.Printf("[INFO] 新输出文件已创建: %s", *outputFile)
+
+		newErrFile, err := os.OpenFile(errOutputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("[FATAL] 无法重新打开错误输出文件 %s: %v", errOutputFile, err)
+		}
+		errFile = newErrFile
+		errWriter = bufio.NewWriterSize(newErrFile, 64*1024)
+
+		log.Printf("[INFO] 新输出文件已创建: %s, %s", *outputFile, errOutputFile)
 	}
 
 	log.Printf("[INFO] 开始处理日志...")
@@ -199,7 +252,7 @@ func main() {
 	// 缓冲区永远装得下两次 checkpoint 之间的全部数据，bufio 不会自动落盘，
 	// 从而杜绝"bufio 已落盘但 checkpoint 未更新 → kill -9 重启后数据重复"。
 	processOne := func(ll LogLine) {
-		if writeEnriched(ll.Data, searcher, *ipField, *geoField, writer, cleaner) {
+		if writeEnriched(ll.Data, searcher, *ipField, *geoField, writer, errWriter, cleaner) {
 			processed++
 		} else {
 			errors++

@@ -36,7 +36,7 @@ func NewFieldCleaner(fields map[string]bool, chars string) *FieldCleaner {
 }
 
 // processRotatedFile 读取轮转后的旧文件中未处理的数据，返回 (成功数, 失败数, 最终已消费偏移)
-func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, ipField, geoField string, writer *bufio.Writer, cleaner *FieldCleaner) (int64, int64, int64) {
+func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, ipField, geoField string, writer *bufio.Writer, errWriter *bufio.Writer, cleaner *FieldCleaner) (int64, int64, int64) {
 	log.Printf("[INFO] 处理轮转旧文件: %s (offset=%d)", oldFilePath, offset)
 
 	f, err := os.Open(oldFilePath)
@@ -61,7 +61,7 @@ func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, 
 			pos += int64(len(line))
 			trimmed := strings.TrimRight(line, "\n\r")
 			if trimmed != "" {
-				if writeEnriched(trimmed, searcher, ipField, geoField, writer, cleaner) {
+				if writeEnriched(trimmed, searcher, ipField, geoField, writer, errWriter, cleaner) {
 					processed++
 				} else {
 					errs++
@@ -77,7 +77,7 @@ func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, 
 		pos += int64(len(line))
 		trimmed := strings.TrimRight(line, "\n\r")
 		if trimmed != "" {
-			if writeEnriched(trimmed, searcher, ipField, geoField, writer, cleaner) {
+			if writeEnriched(trimmed, searcher, ipField, geoField, writer, errWriter, cleaner) {
 				processed++
 			} else {
 				errs++
@@ -86,6 +86,7 @@ func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, 
 	}
 
 	writer.Flush()
+	errWriter.Flush()
 	log.Printf("[INFO] 旧文件处理完成: %s, %d 条成功, %d 条失败, 最终偏移=%d", oldFilePath, processed, errs, pos)
 	return processed, errs, pos
 }
@@ -136,12 +137,13 @@ func enrichLine(line string, searcher *IPSearcher, ipField, geoField string, cle
 	return string(bytes.TrimRight(buf.Bytes(), "\n")), nil
 }
 
-// writeEnriched 增强一行日志并写入，返回是否成功
-func writeEnriched(line string, searcher *IPSearcher, ipField, geoField string, writer *bufio.Writer, cleaner *FieldCleaner) bool {
+// writeEnriched 增强一行日志并写入。成功时写入 writer，解析/处理失败时写入 errWriter。
+// 返回是否成功。
+func writeEnriched(line string, searcher *IPSearcher, ipField, geoField string, writer *bufio.Writer, errWriter *bufio.Writer, cleaner *FieldCleaner) bool {
 	enriched, err := enrichLine(line, searcher, ipField, geoField, cleaner)
 	if err != nil {
 		log.Printf("[WARN] 处理行失败: %v，原始内容: %.200s", err, line)
-		// 构造 fallback JSON，关闭 HTML 转义保持原内容不变
+		// 构造 fallback JSON，写入错误日志文件，关闭 HTML 转义保持原内容不变
 		var fbBuf bytes.Buffer
 		fbEnc := json.NewEncoder(&fbBuf)
 		fbEnc.SetEscapeHTML(false)
@@ -153,8 +155,8 @@ func writeEnriched(line string, searcher *IPSearcher, ipField, geoField string, 
 		if mErr != nil {
 			fallback = []byte(`{"_error":"fallback marshal failed"}`)
 		}
-		writer.Write(fallback)
-		writer.WriteByte('\n')
+		errWriter.Write(fallback)
+		errWriter.WriteByte('\n')
 		return false
 	}
 	writer.WriteString(enriched)
