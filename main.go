@@ -37,6 +37,12 @@ func main() {
 	log.Printf("[INFO] IP 字段:     %s", *ipField)
 	log.Printf("[INFO] Geo 字段:    %s", *geoField)
 
+	// 启动时预检断点文件目录写入权限，避免跑起来才发现写不了
+	if err := touchCheckpoint(*checkpointPath); err != nil {
+		log.Fatalf("[FATAL] 断点文件权限检查失败: %v", err)
+	}
+	log.Printf("[INFO] 断点文件写入权限检查通过: %s", *checkpointPath)
+
 	// 初始化 IP 查询器
 	searcher, err := NewIPSearcher(*v4DBPath, *v6DBPath)
 	if err != nil {

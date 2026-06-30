@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -30,18 +31,31 @@ func loadCheckpoint(path string) (*Checkpoint, error) {
 	return &cp, nil
 }
 
-func saveCheckpoint(path string, cp *Checkpoint) error {
+func saveCheckpoint(path string, cp *Checkpoint) {
 	cp.Updated = time.Now().Format(time.RFC3339)
 	data, err := json.Marshal(cp)
 	if err != nil {
-		return err
+		log.Fatalf("[FATAL] 序列化断点数据失败: %v", err)
 	}
 	// 原子写入：先写临时文件，再 rename
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return err
+		log.Fatalf("[FATAL] 写入断点临时文件失败 (路径=%s): %v", tmpPath, err)
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		log.Fatalf("[FATAL] 重命名断点文件失败 (%s -> %s): %v", tmpPath, path, err)
+	}
+}
+
+// touchCheckpoint 检查断点文件所在目录是否可写（启动时权限预检）。
+// 文件存在则打开不修改内容，不存在则创建空文件验证目录可写。
+func touchCheckpoint(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("无法打开/创建断点文件 %s: %w", path, err)
+	}
+	defer f.Close()
+	return nil
 }
 
 func getFileInode(filePath string) (uint64, error) {
