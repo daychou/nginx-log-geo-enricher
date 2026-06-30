@@ -10,8 +10,32 @@ import (
 	"strings"
 )
 
+// FieldCleaner 字段值清洗配置。
+// Fields 为需要清洗的字段名集合，replacer 预编译去除字符。
+// Fields 为空时不启用清洗（零开销）。
+type FieldCleaner struct {
+	Fields   map[string]bool
+	replacer *strings.Replacer // 预编译的字符去除器
+}
+
+// NewFieldCleaner 创建字段清洗器，预编译 replacer 避免每条日志重复构建。
+// chars 为要去除的字符集合，如 "[]"。
+func NewFieldCleaner(fields map[string]bool, chars string) *FieldCleaner {
+	if len(fields) == 0 {
+		return nil
+	}
+	oldnew := make([]string, 0, len(chars)*2)
+	for _, c := range chars {
+		oldnew = append(oldnew, string(c), "")
+	}
+	return &FieldCleaner{
+		Fields:   fields,
+		replacer: strings.NewReplacer(oldnew...),
+	}
+}
+
 // processRotatedFile 读取轮转后的旧文件中未处理的数据，返回 (成功数, 失败数, 最终已消费偏移)
-func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, ipField, geoField string, writer *bufio.Writer) (int64, int64, int64) {
+func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, ipField, geoField string, writer *bufio.Writer, cleaner *FieldCleaner) (int64, int64, int64) {
 	log.Printf("[INFO] 处理轮转旧文件: %s (offset=%d)", oldFilePath, offset)
 
 	f, err := os.Open(oldFilePath)
@@ -36,7 +60,7 @@ func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, 
 			pos += int64(len(line))
 			trimmed := strings.TrimRight(line, "\n\r")
 			if trimmed != "" {
-				if writeEnriched(trimmed, searcher, ipField, geoField, writer) {
+				if writeEnriched(trimmed, searcher, ipField, geoField, writer, cleaner) {
 					processed++
 				} else {
 					errs++
@@ -52,7 +76,7 @@ func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, 
 		pos += int64(len(line))
 		trimmed := strings.TrimRight(line, "\n\r")
 		if trimmed != "" {
-			if writeEnriched(trimmed, searcher, ipField, geoField, writer) {
+			if writeEnriched(trimmed, searcher, ipField, geoField, writer, cleaner) {
 				processed++
 			} else {
 				errs++
@@ -65,13 +89,24 @@ func processRotatedFile(oldFilePath string, offset int64, searcher *IPSearcher, 
 	return processed, errs, pos
 }
 
-func enrichLine(line string, searcher *IPSearcher, ipField, geoField string) (string, error) {
+func enrichLine(line string, searcher *IPSearcher, ipField, geoField string, cleaner *FieldCleaner) (string, error) {
 	var logEntry map[string]interface{}
 	// 使用 UseNumber 保留数字字段的原始精度（避免大整数被转成 float64 丢精度或变科学计数法）
 	dec := json.NewDecoder(strings.NewReader(line))
 	dec.UseNumber()
 	if err := dec.Decode(&logEntry); err != nil {
 		return "", fmt.Errorf("JSON 解析失败: %w", err)
+	}
+
+	// 清洗指定字段值中的干扰字符（如方括号），仅 cleaner 非 nil 时启用
+	if cleaner != nil {
+		for field := range cleaner.Fields {
+			if v, ok := logEntry[field]; ok {
+				if s, ok := v.(string); ok {
+					logEntry[field] = cleaner.replacer.Replace(s)
+				}
+			}
+		}
 	}
 
 	ipValue, ok := logEntry[ipField]
@@ -97,8 +132,8 @@ func enrichLine(line string, searcher *IPSearcher, ipField, geoField string) (st
 }
 
 // writeEnriched 增强一行日志并写入，返回是否成功
-func writeEnriched(line string, searcher *IPSearcher, ipField, geoField string, writer *bufio.Writer) bool {
-	enriched, err := enrichLine(line, searcher, ipField, geoField)
+func writeEnriched(line string, searcher *IPSearcher, ipField, geoField string, writer *bufio.Writer, cleaner *FieldCleaner) bool {
+	enriched, err := enrichLine(line, searcher, ipField, geoField, cleaner)
 	if err != nil {
 		log.Printf("[WARN] 处理行失败: %v，原始内容: %.200s", err, line)
 		// 用 json.Marshal 构造，保证 fallback 仍是合法 JSON（原始行可能非法，须作为字符串转义）

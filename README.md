@@ -11,6 +11,7 @@
 - **内存可控** — IP 查询缓存上限 100 万条，超限自动清空，防止异常流量导致 OOM
 - **优雅退出** — 响应 SIGINT/SIGTERM 信号，先消费完缓冲区数据再退出
 - **容错设计** — 单行解析失败输出 fallback 记录，不阻塞整体流程；flush 失败暂不推进断点
+- **字段值清洗** — 可选的字段值干扰字符去除（如清洗 `X-Forwarded-For` 中的方括号），避免下游日志平台分词异常
 
 ## 快速开始
 
@@ -43,6 +44,8 @@ go build -o nginx-log-geo-enricher main.go
 | `-field` | `remote` | JSON 中包含 IP 地址的字段名 |
 | `-geofield` | `geo` | 输出 JSON 中存放地理位置的字段名 |
 | `-checkpoint` | `<output目录>/.nginx-geo-enricher.checkpoint` | 断点文件路径 |
+| `-clean-fields` | (空，不启用) | 需要清洗字符的字段名，逗号分隔（如 `real_ip,x_forwarded_for`） |
+| `-clean-chars` | `[]` | 要去除的字符集合 |
 
 ## 工作原理
 
@@ -79,6 +82,35 @@ IPv6: 国家|省|市|区|运营商|国家代码 → 输出 "省市运营商"
 ```json
 {"geo":"广东深圳移动","remote":"120.229.45.112","status":200,"time":"2026-06-30T10:00:00Z"}
 ```
+
+## 字段值清洗
+
+部分字段（如 `http_x_forwarded_for`）可能被恶意传入带方括号的值：
+
+```json
+{"real_ip": "[ranip], 36.137.176.36, 118.178.15.113"}
+```
+
+上传到 SLS 等日志平台时，方括号会导致分词异常。启用清洗后自动去除指定字符。
+
+### 用法
+
+```bash
+# 清洗 real_ip 字段，去除默认的方括号
+./nginx-log-geo-enricher -clean-fields real_ip
+
+# 清洗多个字段，自定义去除字符
+./nginx-log-geo-enricher -clean-fields "real_ip,http_x_forwarded_for" -clean-chars "[] "
+```
+
+### 效果
+
+```
+清洗前: {"real_ip": "[ranip], 36.137.176.36", "geo": "广东深圳移动"}
+清洗后: {"real_ip": "ranip, 36.137.176.36", "geo": "广东深圳移动"}
+```
+
+> **注意**：`-clean-fields` 为空时不启用清洗，零开销，完全向后兼容。清洗仅对字符串类型字段生效，非字符串字段会被跳过。
 
 ## 日志轮转行为
 

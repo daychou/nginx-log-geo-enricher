@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -20,6 +21,8 @@ func main() {
 	ipField := flag.String("field", "remote", "JSON 中包含 IP 地址的字段名")
 	geoField := flag.String("geofield", "geo", "输出 JSON 中存放地理位置的字段名")
 	checkpointPath := flag.String("checkpoint", "", "断点文件路径（默认为输出文件同目录下的 .checkpoint）")
+	cleanFields := flag.String("clean-fields", "", "需要清洗字符的字段名，逗号分隔（如 real_ip,x_forwarded_for）")
+	cleanChars := flag.String("clean-chars", "[]", "要去除的字符集合")
 	flag.Parse()
 
 	if *inputFile == *outputFile {
@@ -36,6 +39,22 @@ func main() {
 	log.Printf("[INFO] 断点文件:    %s", *checkpointPath)
 	log.Printf("[INFO] IP 字段:     %s", *ipField)
 	log.Printf("[INFO] Geo 字段:    %s", *geoField)
+
+	// 构建字段清洗器（clean-fields 为空则不启用）
+	var cleaner *FieldCleaner
+	if *cleanFields != "" {
+		fields := make(map[string]bool)
+		for _, f := range strings.Split(*cleanFields, ",") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				fields[f] = true
+			}
+		}
+		if len(fields) > 0 {
+			cleaner = NewFieldCleaner(fields, *cleanChars)
+			log.Printf("[INFO] 字段清洗已启用: fields=%s chars=%q", *cleanFields, *cleanChars)
+		}
+	}
 
 	// 启动时预检断点文件目录写入权限，避免跑起来才发现写不了
 	if err := touchCheckpoint(*checkpointPath); err != nil {
@@ -82,7 +101,7 @@ func main() {
 			oldFile, findErr := findFileByInode(dir, cp.Inode)
 			if findErr == nil {
 				log.Printf("[INFO] 找到轮转后的旧文件: %s", oldFile)
-				p, e, finalOff := processRotatedFile(oldFile, cp.Offset, searcher, *ipField, *geoField, writer)
+				p, e, finalOff := processRotatedFile(oldFile, cp.Offset, searcher, *ipField, *geoField, writer, cleaner)
 				// 先 flush 输出再落 checkpoint，标记旧文件已消费完，保证补齐过程崩溃可恢复
 				if err := writer.Flush(); err != nil {
 					log.Printf("[WARN] flush 输出失败: %v", err)
@@ -180,7 +199,7 @@ func main() {
 	// 缓冲区永远装得下两次 checkpoint 之间的全部数据，bufio 不会自动落盘，
 	// 从而杜绝"bufio 已落盘但 checkpoint 未更新 → kill -9 重启后数据重复"。
 	processOne := func(ll LogLine) {
-		if writeEnriched(ll.Data, searcher, *ipField, *geoField, writer) {
+		if writeEnriched(ll.Data, searcher, *ipField, *geoField, writer, cleaner) {
 			processed++
 		} else {
 			errors++
