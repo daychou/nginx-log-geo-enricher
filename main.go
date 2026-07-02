@@ -275,6 +275,24 @@ func main() {
 		}
 	}
 
+	// handle 统一处理从 linesChan 收到的元素：
+	//   - 轮转哨兵（Rotated=true）→ 同步轮转输出文件
+	//   - 普通日志行            → 交给 processOne
+	// 轮转哨兵由 tailer 在"旧行全部发送完毕、新文件尚未开始读取"的间隙塞入
+	// linesChan，channel 单调保序，因此主循环必然在所有旧行之后、所有新行
+	// 之前收到哨兵，彻底消除原来双 channel select 随机调度导致的错位竞态。
+	handle := func(ll LogLine) {
+		if ll.Rotated {
+			if linesSinceSave > 0 {
+				saveProgress()
+			}
+			log.Printf("[INFO] 输入日志已轮转，同步轮转输出文件")
+			rotateOutput(ll.RotateTime)
+			return
+		}
+		processOne(ll)
+	}
+
 loop:
 	for {
 		// 第一阶段：阻塞等待至少一行或退出信号
@@ -283,15 +301,12 @@ loop:
 			if !ok {
 				break loop
 			}
-			processOne(ll)
-		case rotateTime := <-tailer.RotateEvents():
-			log.Printf("[INFO] 输入日志已轮转，同步轮转输出文件")
-			rotateOutput(rotateTime)
+			handle(ll)
 		case sig := <-sigChan:
 			log.Printf("[INFO] 收到信号 %v，正在优雅退出...", sig)
 			tailer.Stop()
 			for ll := range tailer.Lines() {
-				processOne(ll)
+				handle(ll)
 			}
 			break loop
 		}
@@ -306,15 +321,12 @@ loop:
 				if !ok {
 					break loop
 				}
-				processOne(ll)
-			case rotateTime := <-tailer.RotateEvents():
-				log.Printf("[INFO] 输入日志已轮转，同步轮转输出文件")
-				rotateOutput(rotateTime)
+				handle(ll)
 			case sig := <-sigChan:
 				log.Printf("[INFO] 收到信号 %v，正在优雅退出...", sig)
 				tailer.Stop()
 				for ll := range tailer.Lines() {
-					processOne(ll)
+					handle(ll)
 				}
 				break loop
 			default:

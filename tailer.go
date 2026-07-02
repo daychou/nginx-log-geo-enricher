@@ -14,9 +14,11 @@ import (
 
 // LogLine 一行日志及其在文件中的精确偏移（用于断点续传）
 type LogLine struct {
-	Data   string // 日志内容（不含换行符）
-	Offset int64  // 此行之后的下一个字节偏移（即断点续传的起始位置）
-	Inode  uint64 // 读取时的文件 inode
+	Data       string    // 日志内容（不含换行符）
+	Offset     int64     // 此行之后的下一个字节偏移（即断点续传的起始位置）
+	Inode      uint64    // 读取时的文件 inode
+	Rotated    bool      // 轮转标记：true 表示这是一个"输入日志已轮转"的哨兵，Data/Offset/Inode 无意义
+	RotateTime time.Time // 仅当 Rotated=true 时有效：轮转检测到的时间，用于输出文件日期后缀
 }
 
 type LogTailer struct {
@@ -30,15 +32,13 @@ type LogTailer struct {
 	stopChan     chan struct{}
 	resumeInode  uint64 // 断点续传：期望的 inode（0=不续传）
 	resumeOffset int64  // 断点续传：seek 到这个偏移开始读
-	rotateChan   chan time.Time // 通知主循环：输入日志已轮转，输出文件需要同步轮转
 }
 
 func NewLogTailer(path string) *LogTailer {
 	return &LogTailer{
-		path:       path,
-		linesChan:  make(chan LogLine, 1000),
-		stopChan:   make(chan struct{}),
-		rotateChan: make(chan time.Time, 1), // 带缓冲，避免发送阻塞
+		path:      path,
+		linesChan: make(chan LogLine, 1000),
+		stopChan:  make(chan struct{}),
 	}
 }
 
@@ -50,11 +50,6 @@ func (t *LogTailer) SetResume(inode uint64, offset int64) {
 
 func (t *LogTailer) Lines() <-chan LogLine {
 	return t.linesChan
-}
-
-// RotateEvents 返回输入日志轮转事件通道，主循环监听此通道以同步轮转输出文件
-func (t *LogTailer) RotateEvents() <-chan time.Time {
-	return t.rotateChan
 }
 
 func (t *LogTailer) Start() {
@@ -120,11 +115,10 @@ func (t *LogTailer) Start() {
 			// 在 EOF（旧文件已读尽）时检测 logrotate 轮转
 			if t.isRotated() {
 				log.Printf("[INFO] 检测到日志轮转, inode=%d 已读到偏移=%d，切换到新文件", t.inode, t.offset)
-				// 通知主循环同步轮转输出文件
-				select {
-				case t.rotateChan <- time.Now():
-				default:
-				}
+				// 通过 linesChan 发送一个轮转哨兵，保证它与旧行/新行之间的顺序
+				// 由 channel 单调保序。主循环收到哨兵后才轮转输出文件，
+				// 从而避免"旧行被写进轮转后的新输出文件"的竞态。
+				t.sendLine(LogLine{Rotated: true, RotateTime: time.Now()})
 				t.closeFile() // 下一轮 openFile 会以"轮转重开"模式从新文件头(offset 0)读取
 				continue
 			}
