@@ -23,6 +23,7 @@ func main() {
 	checkpointPath := flag.String("checkpoint", "", "断点文件路径（默认为输出文件同目录下的 .checkpoint）")
 	cleanFields := flag.String("clean-fields", "", "需要清洗字符的字段名，逗号分隔（如 real_ip,x_forwarded_for）")
 	cleanChars := flag.String("clean-chars", "[]", "要去除的字符集合")
+	retentionDays := flag.Int("retention-days", 0, "输出轮转文件保留天数（<=0 不清理）")
 	flag.Parse()
 
 	if *inputFile == *outputFile {
@@ -45,6 +46,11 @@ func main() {
 	log.Printf("[INFO] 断点文件:    %s", *checkpointPath)
 	log.Printf("[INFO] IP 字段:     %s", *ipField)
 	log.Printf("[INFO] Geo 字段:    %s", *geoField)
+	if *retentionDays > 0 {
+		log.Printf("[INFO] 轮转保留:    %d 天", *retentionDays)
+	} else {
+		log.Printf("[INFO] 轮转保留:    不清理")
+	}
 
 	// 构建字段清洗器（clean-fields 为空则不启用）
 	var cleaner *FieldCleaner
@@ -90,6 +96,17 @@ func main() {
 
 	writer := bufio.NewWriterSize(outFile, 512*1024)
 	errWriter := bufio.NewWriterSize(errFile, 64*1024)
+
+	cleanupOutputs := func() {
+		if *retentionDays <= 0 {
+			return
+		}
+		deleted, failed := cleanupRotatedFiles([]string{*outputFile, errOutputFile}, *retentionDays, time.Now())
+		if deleted > 0 || failed > 0 {
+			log.Printf("[INFO] 轮转文件清理完成: 删除 %d 个, 失败 %d 个", deleted, failed)
+		}
+	}
+	cleanupOutputs()
 
 	// ======== 断点恢复 ========
 	cp, cpErr := loadCheckpoint(*checkpointPath)
@@ -243,6 +260,7 @@ func main() {
 		errWriter = bufio.NewWriterSize(newErrFile, 64*1024)
 
 		log.Printf("[INFO] 新输出文件已创建: %s, %s", *outputFile, errOutputFile)
+		cleanupOutputs()
 	}
 
 	log.Printf("[INFO] 开始处理日志...")
@@ -347,4 +365,48 @@ loop:
 	elapsed := time.Since(startTime).Seconds()
 	log.Printf("[INFO] ======== 程序退出 ========")
 	log.Printf("[INFO] 总处理: %d 条, 错误: %d 条, 耗时: %.1f 秒", processed, errors, elapsed)
+}
+
+func cleanupRotatedFiles(basePaths []string, retentionDays int, now time.Time) (deleted, failed int) {
+	if retentionDays <= 0 {
+		return 0, 0
+	}
+
+	cutoffDate := now.AddDate(0, 0, -(retentionDays - 1)).Format("20060102")
+	for _, basePath := range basePaths {
+		matches, err := filepath.Glob(basePath + "-*")
+		if err != nil {
+			log.Printf("[WARN] 查找轮转文件失败: pattern=%s-* err=%v", basePath, err)
+			failed++
+			continue
+		}
+
+		for _, path := range matches {
+			rotateDate, ok := rotatedFileDate(basePath, path)
+			if !ok || rotateDate >= cutoffDate {
+				continue
+			}
+			if err := os.Remove(path); err != nil {
+				log.Printf("[WARN] 删除过期轮转文件失败: %s err=%v", path, err)
+				failed++
+				continue
+			}
+			log.Printf("[INFO] 已删除过期轮转文件: %s", path)
+			deleted++
+		}
+	}
+	return deleted, failed
+}
+
+func rotatedFileDate(basePath, path string) (string, bool) {
+	suffix := strings.TrimPrefix(path, basePath+"-")
+	if suffix == path || len(suffix) < len("20060102") {
+		return "", false
+	}
+
+	datePart := suffix[:len("20060102")]
+	if _, err := time.Parse("20060102", datePart); err != nil {
+		return "", false
+	}
+	return datePart, true
 }
