@@ -1,6 +1,6 @@
 # nginx-log-geo-enricher
 
-实时追踪 nginx JSON 访问日志，根据客户端 IP 查询地理位置并追加到每条日志中，输出增强后的 JSON 日志。
+不依赖Nginx模块来实现，实时追踪 nginx的原始 JSON 访问日志，根据客户端 IP 查询地理位置并追加到每条日志中，输出增强后的 JSON 日志。
 
 ## 功能特性
 
